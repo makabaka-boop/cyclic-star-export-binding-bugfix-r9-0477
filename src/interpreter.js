@@ -3,7 +3,7 @@ import path from "node:path";
 import { parse } from "acorn";
 import { validateModule } from "./validator.js";
 import { ModuleError } from "./errors.js";
-import { finalizeExports } from "./reexports.js";
+import { resolveToSlot, AMBIGUOUS } from "./reexports.js";
 
 export const MAX_MODULES = 6;
 
@@ -53,11 +53,12 @@ class ModuleRecord {
     this.ast = ast;
     this.env = new Env(null, this);
     this.dependencies = [];
-    this.indirect = [];
-    this.stars = [];
-    this.exportBindings = new Map();
-    this.imports = []; // { localName, exportName, specifier, dep }, source order
-    this.exports = new Map(); // exportName -> localName
+    this.indirect = []; // { name, imported, dep, node } — explicit `export ... from`
+    this.indirectByName = new Map(); // name -> indirect entry
+    this.stars = []; // star-exported dependency modules, in source order
+    this.exportBindings = new Map(); // local exports only: exportName -> Binding
+    this.imports = []; // { localName, exportName, specifier, dep, node }, source order
+    this.exports = new Map(); // exportName -> localName (local exports)
     this.status = "linked"; // linked | evaluating | evaluated | failed
     this.error = null;
     this.chain = [name]; // import chain from the entry, for diagnostics
@@ -158,12 +159,16 @@ export function loadGraph(dir, entryFile) {
         continue;
       }
       if (stmt.type === "ExportNamedDeclaration") {
-        for (const item of stmt.specifiers)
-          m.indirect.push({
+        for (const item of stmt.specifiers) {
+          const entry = {
             name: item.exported.name,
             imported: item.local.name,
             dep,
-          });
+            node: item,
+          };
+          m.indirect.push(entry);
+          m.indirectByName.set(entry.name, entry);
+        }
         continue;
       }
       for (const s of stmt.specifiers) {
@@ -172,6 +177,7 @@ export function loadGraph(dir, entryFile) {
           exportName: s.imported.name,
           specifier: spec,
           dep,
+          node: s,
         });
       }
     }
@@ -263,7 +269,8 @@ export function instantiate(modules) {
       declareIn(m.env, imp.localName, b, m.ast, m);
     }
   }
-  // Pass 3: 'export { x }' / 'export { x as y }' specifiers.
+  // Pass 3: local 'export { x }' / 'export { x as y }' specifiers, then expose
+  // every local export as the concrete binding in its own environment.
   for (const m of modules) {
     for (const stmt of m.ast.body) {
       if (
@@ -290,16 +297,85 @@ export function instantiate(modules) {
       }
     }
   }
-  finalizeExports(modules);
-  // Pass 4: every import must resolve to an existing export of the dependency.
+  for (const m of modules)
+    for (const [exportedName, localName] of m.exports)
+      m.exportBindings.set(exportedName, m.env.vars.get(localName));
+
+  // Pass 4: explicit re-exports. An explicit name shadows star names, must be
+  // unique (against local exports and against other explicit re-exports), and
+  // — like real ESM — its target must exist and be unambiguous at link time
+  // even if nobody imports it. A pure re-export cycle (no declaration
+  // anywhere behind the name) ends here.
+  for (const m of modules) {
+    const seenIndirect = new Set();
+    for (const ind of m.indirect) {
+      if (m.exportBindings.has(ind.name) || seenIndirect.has(ind.name)) {
+        throw new ModuleError(
+          "link",
+          `Duplicate export of '${ind.name}'`,
+          {
+            file: m.name,
+            line: ind.node.loc.start.line,
+            col: ind.node.loc.start.column + 1,
+            chain: m.chain,
+          },
+        );
+      }
+      seenIndirect.add(ind.name);
+      const r = resolveToSlot(ind.dep, ind.imported);
+      if (r === AMBIGUOUS) {
+        throw new ModuleError(
+          "link",
+          `Module '${ind.dep.name}' contains conflicting star exports for name '${ind.imported}' (re-exported by '${m.name}')`,
+          {
+            file: m.name,
+            line: ind.node.loc.start.line,
+            col: ind.node.loc.start.column + 1,
+            chain: m.chain,
+          },
+        );
+      }
+      if (r === null) {
+        throw new ModuleError(
+          "link",
+          `Module '${ind.dep.name}' does not provide an export named '${ind.imported}' (re-exported by '${m.name}')`,
+          {
+            file: m.name,
+            line: ind.node.loc.start.line,
+            col: ind.node.loc.start.column + 1,
+            chain: m.chain,
+          },
+        );
+      }
+    }
+  }
+
+  // Pass 5: every import must resolve to exactly one concrete export of the
+  // dependency. Star ambiguity is only an error once the name is consumed;
+  // importing it is precisely such a consumption.
   for (const m of modules) {
     for (const imp of m.imports) {
-      if (!imp.dep.exportBindings.has(imp.exportName)) {
+      const r = resolveToSlot(imp.dep, imp.exportName);
+      if (r === AMBIGUOUS) {
+        throw new ModuleError(
+          "link",
+          `Module '${imp.dep.name}' contains conflicting star exports for name '${imp.exportName}' (imported by '${m.name}')`,
+          {
+            file: m.name,
+            line: imp.node.loc.start.line,
+            col: imp.node.loc.start.column + 1,
+            chain: m.chain,
+          },
+        );
+      }
+      if (r === null) {
         throw new ModuleError(
           "link",
           `Module '${imp.dep.name}' does not provide export '${imp.exportName}' (imported by '${m.name}')`,
           {
             file: m.name,
+            line: imp.node.loc.start.line,
+            col: imp.node.loc.start.column + 1,
             chain: m.chain,
           },
         );
@@ -406,25 +482,28 @@ function located(kind, message, node, m) {
   });
 }
 
-function resolveBinding(b, seen) {
-  // Follow import indirections to the concrete slot in the exporting module.
-  while (b.kind === "import") {
-    const key = `${b.targetModule.name}#${b.targetName}`;
-    if (seen.has(key)) return null; // circular re-export chain
-    seen.add(key);
-    b = b.targetModule.exportBindings.get(b.targetName);
-    if (!b) return null;
-  }
-  return b;
+// Read an identifier binding: local bindings are used directly, import
+// bindings resolve through the full export machinery to the concrete storage
+// slot of the declaring module (live across any forwarding chain).
+function resolveBinding(raw) {
+  if (raw.kind !== "import") return raw;
+  return resolveToSlot(raw.targetModule, raw.targetName);
 }
 
 function readBinding(m, env, node) {
   const name = node.name;
   const raw = env.lookup(name);
   if (!raw) throw located("reference", `'${name}' is not defined`, node, m);
-  const b = resolveBinding(raw, new Set());
+  const b = resolveBinding(raw);
+  if (b === AMBIGUOUS)
+    throw located(
+      "link",
+      `Module contains conflicting star exports for name '${name}'`,
+      node,
+      m,
+    );
   if (!b)
-    throw located("link", `circular re-export involving '${name}'`, node, m);
+    throw located("link", `No concrete export behind name '${name}'`, node, m);
   if (!b.initialized) {
     throw located(
       "tdz",
@@ -530,8 +609,21 @@ function callFunction(fn) {
 // ---------------------------------------------------------------------------
 
 export function callExport(entry, name) {
-  const exported = entry.exportBindings.get(name);
-  if (exported === undefined) {
+  // Entry exports are resolved the same way as any import: an explicit name
+  // beats a star, diamonds collapse, ambiguity and missing names are link
+  // errors (already raised in instantiate for the reachable graph).
+  const r = resolveToSlot(entry, name);
+  if (r === AMBIGUOUS) {
+    throw new ModuleError(
+      "link",
+      `Module '${entry.name}' contains conflicting star exports for name '${name}'`,
+      {
+        file: entry.name,
+        chain: entry.chain,
+      },
+    );
+  }
+  if (r === null) {
     throw new ModuleError(
       "link",
       `Entry module '${entry.name}' does not export '${name}'`,
@@ -541,9 +633,8 @@ export function callExport(entry, name) {
       },
     );
   }
-  const raw = exported;
-  const b = resolveBinding(raw, new Set());
-  if (!b || !b.initialized || !b.value || b.value.type !== "fn") {
+  const b = r;
+  if (!b.initialized || !b.value || b.value.type !== "fn") {
     throw new ModuleError(
       "type",
       `Export '${name}' of '${entry.name}' is not a function`,

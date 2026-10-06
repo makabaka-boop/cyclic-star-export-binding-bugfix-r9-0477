@@ -142,6 +142,38 @@ const oracleCases = [
       oracleError: "TypeError",
     },
   },
+  {
+    name: "oracle/reexport-live: reads through a star chain track the original slot",
+    dir: "samples/reexport-live",
+    expect: {
+      result: "5",
+      initOrder: ["orig.mjs", "mid.mjs", "main.mjs"],
+    },
+  },
+  {
+    name: "oracle/reexport-star-priority: explicit export wins over star",
+    dir: "samples/reexport-star-priority",
+    expect: {
+      result: "20",
+      initOrder: ["dep.mjs", "mid.mjs", "main.mjs"],
+    },
+  },
+  {
+    name: "oracle/reexport-ambiguous: conflicting stars for a consumed name",
+    dir: "samples/reexport-ambiguous",
+    expect: {
+      error: /conflicting star exports for name 'x'/,
+      oracleError: "SyntaxError",
+    },
+  },
+  {
+    name: "oracle/reexport-cycle: circular star forwarding with real declarations",
+    dir: "samples/reexport-cycle",
+    expect: {
+      result: "33",
+      initOrder: ["b.mjs", "a.mjs", "main.mjs"],
+    },
+  },
 ];
 
 for (const c of oracleCases) {
@@ -398,6 +430,226 @@ test("unit/call-non-function: calling a non-function binding throws", () => {
         /'x' is not a function/,
         "call non-function",
       );
+    },
+  );
+});
+
+// --- re-export (indirect export / star forwarding) semantics ----------------
+
+test("unit/reexport: named forwarding keeps the live slot through chains", () => {
+  withModules(
+    {
+      "o.mjs": "export let v = 1;\nexport function bump() { v = v + 1; return v; }\n",
+      "f1.mjs": "export { v, bump } from './o.mjs';\n",
+      "f2.mjs": "export * from './f1.mjs';\n",
+      "main.mjs":
+        "import { v, bump } from './f2.mjs';\nexport function main() { bump(); return v; }\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+      assert(callExport(entry, "main") === 2, "live read through star+named chain");
+    },
+  );
+});
+
+test("unit/reexport: assigning to a forwarded import is rejected", () => {
+  withModules(
+    {
+      "o.mjs": "export let v = 1;\n",
+      "f.mjs": "export { v } from './o.mjs';\n",
+      "main.mjs": "import { v } from './f.mjs';\nv = 2;\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "failed", `entry status ${entry.status}`);
+      assert(
+        /Cannot assign to imported binding 'v'/.test(entry.error.message),
+        entry.error.message,
+      );
+    },
+  );
+});
+
+test("unit/reexport: same binding over diamond star paths is not ambiguous", () => {
+  withModules(
+    {
+      "o.mjs": "export let v = 5;\n",
+      "l.mjs": "export * from './o.mjs';\n",
+      "r.mjs": "export * from './o.mjs';\n",
+      "m.mjs": "export * from './l.mjs';\nexport * from './r.mjs';\n",
+      "main.mjs":
+        "import { v } from './m.mjs';\nexport function main() { return v; }\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+      assert(callExport(entry, "main") === 5, "diamond stars collapse to one slot");
+    },
+  );
+});
+
+test("unit/reexport: diamond of locally re-exported imports stays live and unique", () => {
+  withModules(
+    {
+      "o.mjs": "export let v = 1;\nexport function inc() { v = v + 10; return v; }\n",
+      "p.mjs": "import { v, inc } from './o.mjs';\nexport { v, inc };\n",
+      "q.mjs": "import { v } from './o.mjs';\nexport { v };\n",
+      "m.mjs": "export * from './p.mjs';\nexport * from './q.mjs';\n",
+      "main.mjs":
+        "import { v, inc } from './m.mjs';\nlet before = v;\nexport function main() { let after = inc(); return before + after + v; }\n",
+    },
+    (dir) => {
+      const { entry, modules, trace } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+      assert(callExport(entry, "main") === 23, "both paths must read & update the original slot");
+      const execs = trace.filter(
+        (t) => t.type === "exec" && t.module === "o.mjs",
+      );
+      assert(execs.length === 1, `o.mjs ran ${execs.length} times`);
+    },
+  );
+});
+
+test("unit/reexport: explicit local export beats conflicting stars", () => {
+  withModules(
+    {
+      "a.mjs": "export let x = 1;\n",
+      "b.mjs": "export let x = 2;\n",
+      "m.mjs":
+        "export * from './a.mjs';\nexport * from './b.mjs';\nlet x = 9;\nexport { x };\n",
+      "main.mjs":
+        "import { x } from './m.mjs';\nexport function main() { return x; }\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+      assert(callExport(entry, "main") === 9, "explicit export must win");
+    },
+  );
+});
+
+test("unit/reexport: conflicting stars only fail when the name is consumed", () => {
+  const files = {
+    "a.mjs": "export let x = 1;\nexport let g = 100;\n",
+    "b.mjs": "export let x = 2;\n",
+    "m.mjs": "export * from './a.mjs';\nexport * from './b.mjs';\n",
+    "main.mjs":
+      "import { g } from './m.mjs';\nexport function main() { return g; }\n",
+  };
+  withModules(files, (dir) => {
+    const { entry } = runInProcess(dir);
+    assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+    assert(callExport(entry, "main") === 100, "unconsumed ambiguity is inert");
+  });
+  withModules(
+    {
+      ...files,
+      "main.mjs":
+        "import { x } from './m.mjs';\nexport function main() { return x; }\n",
+    },
+    (dir) => {
+      assertThrows(
+        () => {
+          const graph = loadGraph(dir, "main.mjs");
+          instantiate(graph.modules);
+        },
+        /conflicting star exports for name 'x'/,
+        "consumed ambiguity",
+      );
+    },
+  );
+});
+
+test("unit/reexport: missing indirect target is rejected before any body runs", () => {
+  withModules(
+    {
+      "d.mjs": "export let a = 1;\n",
+      "f.mjs": "export { nope } from './d.mjs';\nexport let z = 7;\n",
+      "main.mjs":
+        "import { z } from './f.mjs';\nexport function main() { return z; }\n",
+    },
+    (dir) => {
+      const graph = loadGraph(dir, "main.mjs");
+      assertThrows(
+        () => instantiate(graph.modules),
+        /does not provide an export named 'nope'/,
+        "missing indirect target",
+      );
+      for (const m of graph.modules)
+        assert(m.status === "linked", `${m.name} must not execute before link failure`);
+    },
+  );
+});
+
+test("unit/reexport: pure re-export cycle without a declaration is a link error", () => {
+  withModules(
+    {
+      "a.mjs": "export * from './b.mjs';\n",
+      "b.mjs": "export * from './a.mjs';\n",
+      "main.mjs":
+        "import { x } from './a.mjs';\nexport function main() { return x; }\n",
+    },
+    (dir) => {
+      assertThrows(
+        () => {
+          const graph = loadGraph(dir, "main.mjs");
+          instantiate(graph.modules);
+        },
+        /does not provide export 'x'/,
+        "declaration-less re-export cycle",
+      );
+    },
+  );
+});
+
+test("unit/reexport: a declaration behind a resolvable cycle is found", () => {
+  withModules(
+    {
+      "a.mjs": "export * from './b.mjs';\nexport let a1 = 11;\n",
+      "b.mjs": "export * from './a.mjs';\nexport let b1 = 22;\n",
+      "main.mjs":
+        "import { a1, b1 } from './a.mjs';\nexport function main() { return a1 + b1; }\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}: ${entry.error && entry.error.message}`);
+      assert(callExport(entry, "main") === 33, "resolvable star cycle");
+    },
+  );
+});
+
+test("unit/reexport: --call target reachable only via a star export", () => {
+  withModules(
+    {
+      "o.mjs": "export function main() { return 77; }\n",
+      "main.mjs": "export * from './o.mjs';\n",
+    },
+    (dir) => {
+      const { entry } = runInProcess(dir);
+      assert(entry.status === "evaluated", `entry status ${entry.status}`);
+      assert(callExport(entry, "main") === 77, "callExport resolves through stars");
+    },
+  );
+});
+
+test("unit/reexport: failure propagates through a forwarding module once", () => {
+  withModules(
+    {
+      "bad.mjs": "boom();\nexport let x = 1;\n",
+      "f.mjs": "export * from './bad.mjs';\n",
+      "main.mjs":
+        "import { x } from './f.mjs';\nexport function main() { return x; }\n",
+    },
+    (dir) => {
+      const { entry, modules, trace } = runInProcess(dir);
+      assert(entry.status === "failed", `entry status ${entry.status}`);
+      const bad = modules.find((m) => m.name === "bad.mjs");
+      assert(entry.error === bad.error, "recorded error should propagate");
+      const execs = trace.filter(
+        (t) => t.type === "exec" && t.module === "bad.mjs",
+      );
+      assert(execs.length === 1, `bad.mjs ran ${execs.length} times`);
     },
   );
 });

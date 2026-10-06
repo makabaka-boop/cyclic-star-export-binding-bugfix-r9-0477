@@ -70,6 +70,10 @@ error: [tdz] Cannot access 'ax' before initialization
 | `failure` | 求值失败沿菱形图传播，失败体只跑一次 | 失败（`ReferenceError` 对照） |
 | `missing-export` | 链接期缺失导出检查 | 失败（`SyntaxError` 对照） |
 | `assign-import` | 对导入绑定赋值 | 失败（`TypeError` 对照） |
+| `reexport-live` | 星号转发链上的活绑定（导出后自增） | `main() = 5`（快照语义会错算成 3） |
+| `reexport-star-priority` | 显式导出优先于星号转发 | `main() = 20` |
+| `reexport-ambiguous` | 消费真正的同名星号歧义 | 失败（`SyntaxError` 对照） |
+| `reexport-cycle` | 环形星号转发、名字最终有真实声明 | `main() = 33` |
 
 ## 测试
 
